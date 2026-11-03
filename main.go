@@ -13,6 +13,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -108,6 +109,10 @@ func token() (value string, editable bool) {
 	return strings.TrimSpace(string(data)), true
 }
 
+func passwordMatches(given, want string) bool {
+	return want != "" && subtle.ConstantTimeCompare([]byte(given), []byte(want)) == 1
+}
+
 func authorized(r *http.Request) bool {
 	t, _ := token()
 	if t == "" {
@@ -127,6 +132,16 @@ var messages = map[string]string{
 	"mismatch": "The two new passwords are not the same.",
 	"fixed":    "The password is fixed by the server's start options and cannot be changed here.",
 	"error":    "Could not save the password.",
+
+	"tlsoff":     "Certificates need the server to be started with -tls-dir.",
+	"needpass":   "Set a push password first: certificate changes need it.",
+	"nofiles":    "Choose at least one file to upload.",
+	"pair":       "Upload the certificate and the private key together.",
+	"badpair":    "The certificate and key are not valid PEM or do not match.",
+	"badca":      "The CA file is not a valid PEM certificate.",
+	"tlsset":     "Certificates saved.",
+	"tlsremoved": "Certificates removed.",
+	"tlserror":   "Could not save the certificates.",
 }
 
 var page = template.Must(template.New("page").Parse(`<!doctype html>
@@ -142,7 +157,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 </style>
 <h1>OCI Registry</h1>
 {{if .Message}}<p class="msg">{{.Message}}</p>{{end}}
-<p>Serving plain HTTP on <code>{{.Host}}</code>. Pulling needs no password.</p>
+<p>Serving {{if .TLS.Secure}}HTTPS{{else}}plain HTTP{{end}} on <code>{{.Host}}</code>. Pulling needs no password.</p>
 <p>Pushing is <strong>{{if .Enabled}}enabled{{else}}disabled{{end}}</strong>.</p>
 <p>Username: <code>{{.Username}}</code> (fixed)</p>
 {{if .Editable}}
@@ -154,22 +169,31 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
  <button type="submit" name="action" value="set">Save</button>
  {{if .Enabled}}<button type="submit" name="action" value="clear" formnovalidate>Disable push</button>{{end}}
 </form>
-<p><small>The password is sent unencrypted over your network. {{if not .Enabled}}Until one is set, anyone who can open this page can set it.{{end}}</small></p>
+<p><small>{{if not .TLS.Secure}}The password is sent unencrypted over your network. {{end}}{{if not .Enabled}}Until one is set, anyone who can open this page can set it.{{end}}</small></p>
 {{else}}
 <p><small>The password is fixed by the server's start options.</small></p>
 {{end}}
-<p>Push with: <code>podman push --tls-verify=false --creds {{.Username}}:PASSWORD IMAGE {{.Host}}/NAME:TAG</code></p>
+{{template "tls" .TLS}}
+<p>Push with: <code>podman push {{if not .TLS.Active}}--tls-verify=false {{end}}--creds {{.Username}}:PASSWORD IMAGE {{.Host}}/NAME:TAG</code></p>
 `))
+
+type pageData struct {
+	Host, Username    string
+	Enabled, Editable bool
+	TLS               tlsView
+	Message           string
+}
 
 func adminPage(w http.ResponseWriter, r *http.Request) {
 	t, editable := token()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = page.Execute(w, struct {
-		Host, Username    string
-		Enabled, Editable bool
-		Message           string
-	}{r.Host, username, t != "", editable, messages[r.URL.Query().Get("msg")]})
+	view := viewTLS(r)
+	view.CanEdit = t != "" // certificate changes need a password
+	_ = page.Execute(w, pageData{
+		Host: r.Host, Username: username, Enabled: t != "", Editable: editable,
+		TLS: view, Message: messages[r.URL.Query().Get("msg")],
+	})
 }
 
 func setToken(w http.ResponseWriter, r *http.Request) {
@@ -346,6 +370,17 @@ func handleUpload(w http.ResponseWriter, r *http.Request, name, id string) {
 
 func handle(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
+	if (p == "/tls/ca.crt" || p == "/tls/server.crt") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		serveCert(w, r, strings.TrimPrefix(p, "/tls/"))
+		return
+	}
+	if redirectToHTTPS(w, r) {
+		return
+	}
+	if p == "/admin/tls" && r.Method == http.MethodPost {
+		setCerts(w, r)
+		return
+	}
 	if p == "/v2/" || p == "/v2" {
 		// Pulls stay anonymous (200). The challenge header is what makes
 		// Podman/containers-image send its stored login on later requests;
@@ -433,11 +468,20 @@ func main() {
 	flag.StringVar(&root, "dir", "./oci", "OCI image-layout directory")
 	addr := flag.String("addr", ":5000", "listen address")
 	flag.StringVar(&pushToken, "push-token", os.Getenv("OCIREG_PUSH_TOKEN"), "fixed push password (overrides -token-file; push is off when both are empty)")
+	flag.StringVar(&tlsDir, "tls-dir", "", "directory for server.crt, server.key and ca.crt; enables HTTPS (uploadable from the home page) alongside plain HTTP")
 	flag.StringVar(&username, "username", username, "username required to push")
 	flag.StringVar(&tokenFile, "token-file", "", "file holding the push password, changeable from the home page")
 	flag.Parse()
 	http.HandleFunc("/", handle)
 	t, _ := token()
-	log.Printf("ocireg serving %s on %s (push %v)", root, *addr, t != "")
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	log.Printf("ocireg serving %s on %s (push %v, tls dir %q)", root, *addr, t != "", tlsDir)
+	if tlsDir == "" {
+		log.Fatal(http.ListenAndServe(*addr, nil))
+	}
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := &http.Server{ConnContext: connContext, ReadHeaderTimeout: 30 * time.Second}
+	log.Fatal(srv.Serve(muxListener{ln}))
 }

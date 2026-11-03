@@ -5,3 +5,6 @@
 
 # downloaded packaging tool (package.sh re-fetches and checks it)
 /.cache/
+
+# private keys and certificates
+/certs/
