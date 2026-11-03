@@ -7,11 +7,9 @@ APKG_PATH=$(readlink -f "${1:-$(dirname "$0")}")
 
 mkdir -p ${DATA_DIR}/oci
 
-# Push is disabled unless this file exists and holds a password.
-if [ -s ${DATA_DIR}/push-token ]; then
-    export OCIREG_PUSH_TOKEN=$(cat ${DATA_DIR}/push-token)
-fi
-
 [ -n "$(pidof ${BINARY})" ] && exit 0
 
-nohup ${APKG_PATH}/${BINARY} -dir ${DATA_DIR}/oci -addr :${PORT} >> /tmp/${APKG_NAME}.log 2>&1 &
+# The push password is kept in ${DATA_DIR}/push-token and is set from the app's
+# page (Apps > OCI Registry). Push stays off until one is set.
+nohup ${APKG_PATH}/${BINARY} -dir ${DATA_DIR}/oci -addr :${PORT} \
+    -token-file ${DATA_DIR}/push-token >> /tmp/${APKG_NAME}.log 2>&1 &

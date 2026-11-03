@@ -10,21 +10,26 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const nameRe = `([a-z0-9][a-z0-9._/-]*)`
 
 var (
 	root      string
-	pushToken string
+	pushToken string // fixed by -push-token / OCIREG_PUSH_TOKEN; cannot be changed from the page
+	username  = "ocireg"
+	tokenFile string // optional; holds the push password and is changed from the page
 	mu        sync.Mutex
 	hexRe     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	uploadRe  = regexp.MustCompile(`^/v2/` + nameRe + `/blobs/uploads/([0-9a-f]{32})?$`)
@@ -81,20 +86,139 @@ func resolve(name, ref string) string {
 	return ""
 }
 
-func writeAtomic(path string, data []byte) error {
+func writeAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, perm); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
 }
 
+// token returns the push password (empty means push is off) and whether the
+// page may change it. The file is re-read on every call, so a change applies
+// at once.
+func token() (value string, editable bool) {
+	if pushToken != "" {
+		return pushToken, false
+	}
+	if tokenFile == "" {
+		return "", false
+	}
+	data, _ := os.ReadFile(tokenFile)
+	return strings.TrimSpace(string(data)), true
+}
+
 func authorized(r *http.Request) bool {
-	if pushToken == "" {
+	t, _ := token()
+	if t == "" {
 		return false
 	}
-	_, pass, ok := r.BasicAuth()
-	return ok && subtle.ConstantTimeCompare([]byte(pass), []byte(pushToken)) == 1
+	user, pass, ok := r.BasicAuth()
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(username))
+	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(t))
+	return ok && userOK&passOK == 1
+}
+
+var messages = map[string]string{
+	"set":      "Push password saved.",
+	"cleared":  "Push is now disabled.",
+	"wrong":    "The current password is wrong.",
+	"short":    "The new password must be at least 8 characters on one line.",
+	"mismatch": "The two new passwords are not the same.",
+	"fixed":    "The password is fixed by the server's start options and cannot be changed here.",
+	"error":    "Could not save the password.",
+}
+
+var page = template.Must(template.New("page").Parse(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCI Registry</title>
+<style>
+ body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:2rem auto;padding:0 1rem}
+ code{background:#eee;padding:.1rem .3rem;border-radius:3px}
+ input{display:block;margin:.4rem 0 1rem;padding:.4rem;width:100%;box-sizing:border-box}
+ button{padding:.5rem 1rem;margin-right:.5rem}
+ .msg{background:#eef;padding:.5rem 1rem;border-radius:4px}
+</style>
+<h1>OCI Registry</h1>
+{{if .Message}}<p class="msg">{{.Message}}</p>{{end}}
+<p>Serving plain HTTP on <code>{{.Host}}</code>. Pulling needs no password.</p>
+<p>Pushing is <strong>{{if .Enabled}}enabled{{else}}disabled{{end}}</strong>.</p>
+<p>Username: <code>{{.Username}}</code> (fixed)</p>
+{{if .Editable}}
+<h2>{{if .Enabled}}Change or disable the push password{{else}}Set a push password{{end}}</h2>
+<form method="post" action="/admin/token">
+ {{if .Enabled}}<label>Current password<input type="password" name="current" autocomplete="current-password" required></label>{{end}}
+ <label>New password (at least 8 characters)<input type="password" name="new" autocomplete="new-password"></label>
+ <label>Repeat new password<input type="password" name="confirm" autocomplete="new-password"></label>
+ <button type="submit" name="action" value="set">Save</button>
+ {{if .Enabled}}<button type="submit" name="action" value="clear" formnovalidate>Disable push</button>{{end}}
+</form>
+<p><small>The password is sent unencrypted over your network. {{if not .Enabled}}Until one is set, anyone who can open this page can set it.{{end}}</small></p>
+{{else}}
+<p><small>The password is fixed by the server's start options.</small></p>
+{{end}}
+<p>Push with: <code>podman push --tls-verify=false --creds {{.Username}}:PASSWORD IMAGE {{.Host}}/NAME:TAG</code></p>
+`))
+
+func adminPage(w http.ResponseWriter, r *http.Request) {
+	t, editable := token()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = page.Execute(w, struct {
+		Host, Username    string
+		Enabled, Editable bool
+		Message           string
+	}{r.Host, username, t != "", editable, messages[r.URL.Query().Get("msg")]})
+}
+
+func setToken(w http.ResponseWriter, r *http.Request) {
+	back := func(code string) { http.Redirect(w, r, "/?msg="+code, http.StatusSeeOther) }
+	// A browser sends Origin on a form post; refuse one from another site.
+	if o := r.Header.Get("Origin"); o != "" {
+		if u, err := url.Parse(o); err != nil || u.Host != r.Host {
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
+			return
+		}
+	}
+	current, editable := token()
+	if !editable {
+		back("fixed")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if current != "" && subtle.ConstantTimeCompare([]byte(r.PostForm.Get("current")), []byte(current)) != 1 {
+		time.Sleep(time.Second) // slow down guessing
+		back("wrong")
+		return
+	}
+	if r.PostForm.Get("action") == "clear" {
+		if err := os.Remove(tokenFile); err != nil && !os.IsNotExist(err) {
+			back("error")
+			return
+		}
+		back("cleared")
+		return
+	}
+	next := r.PostForm.Get("new")
+	if next != r.PostForm.Get("confirm") {
+		back("mismatch")
+		return
+	}
+	if len(next) < 8 || strings.ContainsAny(next, "\r\n") {
+		back("short")
+		return
+	}
+	if err := writeAtomic(tokenFile, []byte(next+"\n"), 0o600); err != nil {
+		log.Printf("saving push password: %v", err)
+		back("error")
+		return
+	}
+	back("set")
 }
 
 func putManifest(w http.ResponseWriter, r *http.Request, name, ref string) {
@@ -107,7 +231,7 @@ func putManifest(w http.ResponseWriter, r *http.Request, name, ref string) {
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	dir := filepath.Join(root, "blobs", "sha256")
 	_ = os.MkdirAll(dir, 0o755)
-	if err := writeAtomic(filepath.Join(dir, hex.EncodeToString(sum[:])), data); err != nil {
+	if err := writeAtomic(filepath.Join(dir, hex.EncodeToString(sum[:])), data, 0o644); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -130,7 +254,7 @@ func putManifest(w http.ResponseWriter, r *http.Request, name, ref string) {
 			Annotations: map[string]string{"org.opencontainers.image.ref.name": tag},
 		})
 		out, _ := json.Marshal(idx)
-		err = writeAtomic(filepath.Join(root, "index.json"), out)
+		err = writeAtomic(filepath.Join(root, "index.json"), out, 0o644)
 		mu.Unlock()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -226,11 +350,19 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if p == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		adminPage(w, r)
+		return
+	}
+	if p == "/admin/token" && r.Method == http.MethodPost {
+		setToken(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 	case http.MethodPost, http.MethodPut, http.MethodPatch:
-		if pushToken == "" {
-			http.Error(w, "push is disabled (start with -push-token)", http.StatusMethodNotAllowed)
+		if t, _ := token(); t == "" {
+			http.Error(w, "push is disabled (set a password on the registry's home page)", http.StatusMethodNotAllowed)
 			return
 		}
 		if !authorized(r) {
@@ -294,9 +426,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 func main() {
 	flag.StringVar(&root, "dir", "./oci", "OCI image-layout directory")
 	addr := flag.String("addr", ":5000", "listen address")
-	flag.StringVar(&pushToken, "push-token", os.Getenv("OCIREG_PUSH_TOKEN"), "password required to push (push is disabled when empty)")
+	flag.StringVar(&pushToken, "push-token", os.Getenv("OCIREG_PUSH_TOKEN"), "fixed push password (overrides -token-file; push is off when both are empty)")
+	flag.StringVar(&username, "username", username, "username required to push")
+	flag.StringVar(&tokenFile, "token-file", "", "file holding the push password, changeable from the home page")
 	flag.Parse()
 	http.HandleFunc("/", handle)
-	log.Printf("ocireg serving %s on %s (push %v)", root, *addr, pushToken != "")
+	t, _ := token()
+	log.Printf("ocireg serving %s on %s (push %v)", root, *addr, t != "")
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }

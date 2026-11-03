@@ -9,3 +9,6 @@ APKG_PATH=$(readlink -f $1)
 WEBDIR="/var/www/${APKG_NAME}/"
 mkdir -p ${WEBDIR}
 ln -sf ${APKG_PATH}/web/* ${WEBDIR}
+
+# tell the page which port the registry listens on
+echo "${PORT}" > ${WEBDIR}/port

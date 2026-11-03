@@ -1,7 +1,10 @@
-<?php $host = explode(':', $_SERVER['HTTP_HOST'])[0]; ?>
-<!doctype html>
-<meta charset="utf-8">
-<title>OCI Registry</title>
-<h1>OCI Registry</h1>
-<p>Serving on <code><?php echo htmlspecialchars($host); ?>:5000</code> (plain HTTP).</p>
-<p>Pull: <code>--from <?php echo htmlspecialchars($host); ?>:5000/NAME:TAG</code></p>
+<?php
+// The configure page is served by the registry itself; send the browser there.
+$port = 5000;
+$file = __DIR__ . '/port';
+if (is_readable($file) && ctype_digit(trim(file_get_contents($file)))) {
+    $port = (int) trim(file_get_contents($file));
+}
+$host = explode(':', $_SERVER['HTTP_HOST'])[0];
+header("Location: http://{$host}:{$port}/");
+?>
