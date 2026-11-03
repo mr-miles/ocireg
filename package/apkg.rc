@@ -1,0 +1,19 @@
+Package:	ocireg
+Version:	0.1.0
+Packager:	local
+Email:
+Homepage:
+Description:	Tiny OCI container registry (pull open, push with token)
+Icon:		ocireg.png
+AddonShowName:	OCI Registry
+AddonIndexPage:	index.php
+AddonUsedPort:
+InstDepend:
+InstConflict:
+StartDepend:
+StartConflict:
+CenterType:
+UserControl:
+MinFWVer:
+MaxFWVer:
+IndividualFlag: 0

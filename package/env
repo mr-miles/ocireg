@@ -1,0 +1,7 @@
+APKG_NAME="ocireg"
+BINARY="ocireg"
+PORT=5000
+
+# Images and the optional push token live outside the app folder, so they
+# survive an uninstall or upgrade.
+DATA_DIR=/shares/Volume_1/Nas_Prog/ocireg_data
