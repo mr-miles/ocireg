@@ -347,6 +347,12 @@ func handleUpload(w http.ResponseWriter, r *http.Request, name, id string) {
 func handle(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	if p == "/v2/" || p == "/v2" {
+		// Pulls stay anonymous (200). The challenge header is what makes
+		// Podman/containers-image send its stored login on later requests;
+		// without it a push is attempted with no credentials and gets a 401.
+		if t, _ := token(); t != "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="ocireg"`)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
