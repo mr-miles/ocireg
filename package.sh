@@ -2,7 +2,11 @@
 # Build ocireg for the WD My Cloud EX2 Ultra and wrap it as an installable .bin
 # for My Cloud OS5 (upload under Apps > Install an app manually).
 #
-#   ./package.sh            -> dist/*_ocireg_*.bin
+#   ./package.sh                  -> dist/*_ocireg_*.bin
+#   VERSION=0.2.0 ./package.sh    -> same, with that version in the package
+#
+# VERSION, when set, replaces the Version in package/apkg.rc (only in the
+# staged copy, so the source file is left alone). CI sets it from the git tag.
 #
 # Needs: go, curl, docker. WD's mksapkg-OS5 is a x86-64 binary that wants
 # libxml2 and an OpenSSL with Blowfish, so it runs inside a Debian container.
@@ -37,6 +41,19 @@ mkdir -p "$STAGE/ocireg"
 cp -r package/. "$STAGE/ocireg/"
 cp ocireg-armv7 "$STAGE/ocireg/ocireg"
 chmod +x "$STAGE/ocireg/ocireg"
+
+if [ -n "${VERSION:-}" ]; then
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        echo "VERSION must look like 1.2.3 (got '$VERSION')" >&2
+        exit 1
+    }
+    sed -i "s/^Version:[[:space:]].*/Version:\t$VERSION/" "$STAGE/ocireg/apkg.rc"
+    grep -q "^Version:	$VERSION\$" "$STAGE/ocireg/apkg.rc" || {
+        echo "could not set the version in apkg.rc" >&2
+        exit 1
+    }
+fi
+echo "Packaging version $(sed -n 's/^Version:[[:space:]]*//p' "$STAGE/ocireg/apkg.rc")"
 
 # Pass proxy settings through when set (a no-op otherwise).
 docker run --rm -e http_proxy -e https_proxy -e HTTP_PROXY -e HTTPS_PROXY -e no_proxy -e NO_PROXY \

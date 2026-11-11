@@ -26,8 +26,17 @@ jobs:
           test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
           go vet ./...
 
+      - name: Test
+        run: go test ./...
+
+      # On a tag build the version comes from the tag (v0.2.0 -> 0.2.0);
+      # otherwise package/apkg.rc's own Version is used.
       - name: Build the .bin
-        run: ./package.sh
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          ./package.sh
 
       - uses: actions/upload-artifact@v7
         with:
