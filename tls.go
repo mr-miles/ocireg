@@ -307,7 +307,7 @@ func setCerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !passwordMatches(r.FormValue("current"), current) {
-		time.Sleep(time.Second)
+		slowDown()
 		back("wrong")
 		return
 	}
