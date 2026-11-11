@@ -77,15 +77,17 @@ func blobPath(digest string) string {
 	return p
 }
 
-// resolve maps name:tag to a digest. A layout holding a single image answers
-// for any tag, so a directory made by `podman save --format oci-dir` just works.
+// resolve maps name:tag to a digest. The match is exact, as in other
+// registries: app:latest, localhost/app:latest and myapp:latest are different
+// images. A layout holding a single image answers for any tag, so a directory
+// made by `podman save --format oci-dir` just works.
 func resolve(name, ref string) string {
 	if strings.HasPrefix(ref, "sha256:") {
 		return ref
 	}
 	idx := readIndex()
 	for _, m := range idx.Manifests {
-		if strings.HasSuffix(m.Annotations["org.opencontainers.image.ref.name"], name+":"+ref) {
+		if m.Annotations["org.opencontainers.image.ref.name"] == name+":"+ref {
 			return m.Digest
 		}
 	}
