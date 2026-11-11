@@ -35,7 +35,15 @@ var (
 	hexRe     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	uploadRe  = regexp.MustCompile(`^/v2/` + nameRe + `/blobs/uploads/([0-9a-f]{32})?$`)
 	routeRe   = regexp.MustCompile(`^/v2/` + nameRe + `/(manifests|blobs)/([^/]+)$`)
+
+	// authFailDelay is how long a wrong password is held before the reply,
+	// to slow down guessing. It is unexported and has no flag or env var, so
+	// only this package's own tests can change it.
+	authFailDelay = time.Second
 )
+
+// slowDown delays the reply to a wrong password.
+func slowDown() { time.Sleep(authFailDelay) }
 
 type descriptor struct {
 	MediaType   string            `json:"mediaType"`
@@ -216,7 +224,7 @@ func setToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if current != "" && subtle.ConstantTimeCompare([]byte(r.PostForm.Get("current")), []byte(current)) != 1 {
-		time.Sleep(time.Second) // slow down guessing
+		slowDown()
 		back("wrong")
 		return
 	}
@@ -385,8 +393,19 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// Pulls stay anonymous (200). The challenge header is what makes
 		// Podman/containers-image send its stored login on later requests;
 		// without it a push is attempted with no credentials and gets a 401.
+		//
+		// `podman login` / `docker login` verify credentials by sending them
+		// to this endpoint and treating 200 as success, so credentials that
+		// are present must actually be checked here. Otherwise a wrong
+		// username or password is "accepted" and saved, and only fails later
+		// on push with "authentication required".
 		if t, _ := token(); t != "" {
 			w.Header().Set("WWW-Authenticate", `Basic realm="ocireg"`)
+			if r.Header.Get("Authorization") != "" && !authorized(r) {
+				slowDown()
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		return
